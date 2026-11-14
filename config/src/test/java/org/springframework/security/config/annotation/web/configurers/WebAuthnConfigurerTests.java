@@ -21,8 +21,13 @@ import java.util.List;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationHandler;
+import io.micrometer.observation.ObservationRegistry;
+import io.micrometer.observation.ObservationTextPublisher;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.config.BeanPostProcessor;
@@ -32,11 +37,15 @@ import org.springframework.http.HttpOutputMessage;
 import org.springframework.http.converter.HttpMessageConverter;
 import org.springframework.security.authentication.AuthenticationEventPublisher;
 import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.AuthenticationObservationContext;
+import org.springframework.security.authentication.ObservationAuthenticationManager;
 import org.springframework.security.authentication.ProviderManager;
+import org.springframework.security.authentication.ProviderNotFoundException;
 import org.springframework.security.authentication.TestingAuthenticationToken;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.observation.SecurityObservationSettings;
 import org.springframework.security.config.test.SpringTestContext;
 import org.springframework.security.config.test.SpringTestContextExtension;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -62,11 +71,15 @@ import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.hamcrest.Matchers.containsString;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willAnswer;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -336,6 +349,45 @@ public class WebAuthnConfigurerTests {
 		assertThat(publisher.getClass().getName()).contains("NullEventPublisher");
 	}
 
+	@Test
+	public void webauthnWhenObservationRegistryThenAuthenticationObserved() {
+		this.spring.register(DefaultWebauthnConfiguration.class, ObservationRegistryConfig.class).autowire();
+
+		AuthenticationManager authManager = webAuthnAuthenticationManager();
+		assertThat(authManager).isInstanceOf(ObservationAuthenticationManager.class);
+
+		assertThatExceptionOfType(ProviderNotFoundException.class)
+			.isThrownBy(() -> authManager.authenticate(new TestingAuthenticationToken("user", "password")));
+		ObservationHandler<Observation.Context> handler = this.spring.getContext().getBean(ObservationHandler.class);
+		ArgumentCaptor<Observation.Context> context = ArgumentCaptor.forClass(Observation.Context.class);
+		verify(handler, atLeastOnce()).onStart(context.capture());
+		assertThat(context.getAllValues()).anyMatch(AuthenticationObservationContext.class::isInstance);
+	}
+
+	@Test
+	public void webauthnWhenExcludeAuthenticationObservationsThenUnobserved() {
+		this.spring
+			.register(DefaultWebauthnConfiguration.class, ObservationRegistryConfig.class,
+					SelectableObservationsConfig.class)
+			.autowire();
+
+		AuthenticationManager authManager = webAuthnAuthenticationManager();
+		assertThat(authManager).isInstanceOf(ProviderManager.class);
+	}
+
+	private AuthenticationManager webAuthnAuthenticationManager() {
+		FilterChainProxy filterChain = this.spring.getContext().getBean(FilterChainProxy.class);
+		WebAuthnAuthenticationFilter webAuthnFilter = filterChain.getFilterChains()
+			.get(0)
+			.getFilters()
+			.stream()
+			.filter(WebAuthnAuthenticationFilter.class::isInstance)
+			.map(WebAuthnAuthenticationFilter.class::cast)
+			.findFirst()
+			.orElseThrow();
+		return (AuthenticationManager) ReflectionTestUtils.getField(webAuthnFilter, "authenticationManager");
+	}
+
 	@Configuration
 	@EnableWebSecurity
 	static class ConfigCredentialCreationOptionsRepository {
@@ -603,6 +655,35 @@ public class WebAuthnConfigurerTests {
 		@Bean
 		SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
 			return http.csrf(AbstractHttpConfigurer::disable).webAuthn(Customizer.withDefaults()).build();
+		}
+
+	}
+
+	@Configuration(proxyBeanMethods = false)
+	static class ObservationRegistryConfig {
+
+		private final ObservationHandler<Observation.Context> handler = spy(new ObservationTextPublisher());
+
+		@Bean
+		ObservationHandler<Observation.Context> observationHandler() {
+			return this.handler;
+		}
+
+		@Bean
+		ObservationRegistry observationRegistry() {
+			ObservationRegistry registry = ObservationRegistry.create();
+			registry.observationConfig().observationHandler(this.handler);
+			return registry;
+		}
+
+	}
+
+	@Configuration(proxyBeanMethods = false)
+	static class SelectableObservationsConfig {
+
+		@Bean
+		SecurityObservationSettings observabilityDefaults() {
+			return SecurityObservationSettings.withDefaults().shouldObserveAuthentications(false).build();
 		}
 
 	}
